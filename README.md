@@ -54,6 +54,21 @@
 - 无锁定时结果与历史行为**完全一致**，现有写入与结果查询的
   请求/响应保持兼容。
 
+### 版本快照（复核员按版本回看 / 比较）
+
+每个真正推进的版本都在**同一事务**留存一份不可变快照，供复核员回看与
+两版比较：
+
+- **创建演练即留存 0 版快照**（空场：无配对、无未配对、无锁定）；
+- 每次**日志写入/更正真正推进版本**、**锁定/解除锁定推进版本**时，
+  同事务留存该版的**配对（含时差）、未配对记录、总时差与锁定清单**；
+- **同内容重传、失败回滚（含整批拒绝、锁定校验失败、解除不存在的锁定）、
+  封存均不产生新快照**；封存本身不改版本，快照中的**封存状态仍从现态读取**；
+- **升级既有服务时**：旧库在启动初始化阶段为每个演练从**升级时的当前
+  版本**开始留存一份快照，**更早的版本不用现态补造**（取回/比较均明确
+  报错）；升级后的版本推进照常逐版留存；
+- 取回快照与比较版本都是**只读**操作，不改变当前状态、版本与锁定。
+
 ### 版本语义
 
 - 每条日志以 `(演练号, 记录号)` 唯一标识；
@@ -68,7 +83,10 @@
 - 并发写入通过 SQLite `BEGIN IMMEDIATE` 串行化，版本号与配对结果
   **原子更新**，不会出现版本与结果错位；
 - **封存**演练后拒绝一切写入（返回 `409`），但仍可查询最终结果；
-  封存本身不改变配对结果与版本。
+  封存本身不改变配对结果与版本，也**不产生新版本快照**；
+- 每个真正推进的版本（含创建时的 0 版）在同事务留存**版本快照**
+  （配对/未配对/总时差/锁定清单）；重传与失败回滚不留存，
+  升级既有库仅从升级时当前版本开始留存、旧版本不补造。
 
 ---
 
@@ -99,8 +117,8 @@ docker compose down -v       # 停止并删除数据卷
 ### 仅用 Docker
 
 ```bash
-docker build -t qso-log-attestation:1.1.0 .
-docker run -d --name qso -p 8080:8080 -v qso-data:/data qso-log-attestation:1.1.0
+docker build -t qso-log-attestation:1.2.0 .
+docker run -d --name qso -p 8080:8080 -v qso-data:/data qso-log-attestation:1.2.0
 ```
 
 ---
@@ -325,6 +343,96 @@ curl -X POST http://127.0.0.1:8080/drills/DRILL-2026/locks/unlock \
 
 锁定操作的校验规则与错误见下节错误表。
 
+### 5.5 版本快照（按版本回看 / 两版比较）
+
+#### `GET /drills/{drill_id}/snapshots` —— 列出已留存快照的版本号
+
+```bash
+curl http://127.0.0.1:8080/drills/DRILL-2026/snapshots
+```
+
+```json
+{ "drill_id": "DRILL-2026", "versions": [0, 1, 2, 3] }
+```
+
+0 版在创建演练时即存在；升级前的旧版本不在此清单中（不可回看）。
+
+#### `GET /drills/{drill_id}/snapshots/{version}` —— 取回指定版本快照
+
+```bash
+curl http://127.0.0.1:8080/drills/DRILL-2026/snapshots/2
+```
+
+```json
+{
+  "drill_id": "DRILL-2026",
+  "version": 2,
+  "sealed": false,
+  "pairs": [
+    {"record_a": "R1", "record_b": "R2", "time_diff_seconds": 5.0}
+  ],
+  "unpaired": ["R3"],
+  "total_time_diff_seconds": 5.0,
+  "locks": [
+    {"record_a": "R1", "record_b": "R2",
+     "time_diff_seconds": 5.0,
+     "locked_at": "2026-10-04T12:00:05.000000+00:00"}
+  ],
+  "snapshot_at": "2026-10-04T12:00:05.234567+00:00"
+}
+```
+
+- `pairs` / `unpaired` / `locks` 为该版**留存时**的内容，之后不再改变；
+- `sealed` 是唯一的现态字段：封存后回看任意版本都显示 `true`；
+- 未知演练 `404 drill_not_found`；版本未留存 `404 snapshot_not_found`。
+
+#### `GET /drills/{drill_id}/snapshots/{from}/diff/{to}` —— 比较两个已留存版本
+
+按记录号**稳定排序**列出配对、未配对记录与锁定对的新增/移除，
+**同一记录对的时差变化单列**：
+
+```bash
+curl http://127.0.0.1:8080/drills/DRILL-2026/snapshots/1/diff/3
+```
+
+```json
+{
+  "drill_id": "DRILL-2026",
+  "from_version": 1,
+  "to_version": 3,
+  "pairs": {
+    "added":   [{"record_a": "R3", "record_b": "R6", "time_diff_seconds": 8.0}],
+    "removed": [],
+    "time_diff_changed": [
+      {"record_a": "R1", "record_b": "R2",
+       "from_time_diff_seconds": 5.0, "to_time_diff_seconds": 9.0}
+    ]
+  },
+  "unpaired": {
+    "added": ["R7"],
+    "removed": ["R3", "R6"]
+  },
+  "locks": {
+    "added":   [{"record_a": "R1", "record_b": "R2",
+                 "time_diff_seconds": 9.0,
+                 "locked_at": "2026-10-04T12:00:05.000000+00:00"}],
+    "removed": []
+  },
+  "total_time_diff_seconds": {"from": 5.0, "to": 17.0, "delta": 12.0}
+}
+```
+
+- 配对以 `(record_a, record_b)` 身份比较：`added` 取 **to（新）版**内容，
+  `removed` 取 **from（旧）版**内容；两版都在但时差不同的对进入
+  `pairs.time_diff_changed`，不重复计入新增/移除；
+- `unpaired.added/removed` 为记录号集合差异，按记录号升序；
+- `locks.added/removed` 按锁定对身份比较（锁定对仅时差变化时不出现，
+  其时差变化已在 `pairs.time_diff_changed` 体现），列表按记录对升序；
+- `total_time_diff_seconds` 给出两版总时差及 `delta`（to − from）；
+- **相同版本**比较合法，各差异节均为空、`delta` 为 0（该版本仍须已留存）；
+- 两个版本都必须已留存，否则 `404 snapshot_not_found`；未知演练
+  `404 drill_not_found`。比较为只读，不改变任何当前状态。
+
 ---
 
 ## 6. 错误响应与状态码
@@ -348,6 +456,7 @@ curl -X POST http://127.0.0.1:8080/drills/DRILL-2026/locks/unlock \
 | 锁定涉及的记录已被其他锁定占用 | `409` | `record_already_locked` |
 | 解除不存在的锁定 | `404` | `lock_not_found` |
 | 写入/更正使任一既有锁定失效 | `409` | `lock_invalidated`（整次写入拒绝、状态不变） |
+| 取回/比较未留存版本（含升级前旧版本） | `404` | `snapshot_not_found` |
 
 ---
 
@@ -358,13 +467,13 @@ curl -X POST http://127.0.0.1:8080/drills/DRILL-2026/locks/unlock \
 ├── app/
 │   ├── main.py          # FastAPI 路由、异常处理、lifespan 初始化
 │   ├── schemas.py       # 请求/响应模型与输入校验（时区/负值/同呼号）
-│   ├── database.py      # SQLite 持久化、事务、版本/封存/锁定逻辑
+│   ├── database.py      # SQLite 持久化、事务、版本/封存/锁定/版本快照
 │   ├── matching.py      # 配对核心算法（二分图最小费用最大流，支持强制锁定）
 │   └── config.py        # 环境变量配置
 ├── scripts/
-│   ├── init_db.py       # 数据初始化（建库/建表/WAL，幂等）
-│   └── demo.py          # 端到端调用演示（纯标准库）
-├── tests/               # 算法单测（含穷举对照）+ HTTP 集成测试
+│   ├── init_db.py       # 数据初始化（建库/建表/WAL/旧库快照回填，幂等）
+│   └── demo.py          # 端到端调用演示（含版本回看/比较，纯标准库）
+├── tests/               # 算法单测（含穷举对照）+ HTTP 集成测试（含快照）
 ├── examples/requests.http
 ├── Dockerfile
 ├── docker-compose.yml

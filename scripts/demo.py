@@ -125,7 +125,41 @@ def main(base_url: str) -> None:
 
     show("查询最终互证结果", *call("GET", f"{base_url}/drills/{drill}/result"))
 
+    # --- 版本快照：复核员按版本回看、比较两版差异（只读） ---
+    # 列出已留存版本号（创建即有 0；每次真正推进版本同事务留存一版）
+    show("已留存快照版本号", *call(
+        "GET", f"{base_url}/drills/{drill}/snapshots"
+    ))
+
+    # 取回 0 版（创建演练时的空场快照）
+    show("回看 0 版快照（空场）", *call(
+        "GET", f"{base_url}/drills/{drill}/snapshots/0"
+    ))
+
+    # 比较解锁前后两版：配对/未配对/锁定的新增移除、同一对时差变化单列。
+    # 当前版本为锁定解除后的版本；取其与“锁定中”的上一版比较。
+    status, result = call("GET", f"{base_url}/drills/{drill}/result")
+    cur_v = result["version"]
+    show(f"比较 {cur_v - 1} -> {cur_v} 版（锁定解除前后）", *call(
+        "GET", f"{base_url}/drills/{drill}/snapshots/{cur_v - 1}/diff/{cur_v}"
+    ))
+
+    # 相同版本差异为空（该版本须已留存）
+    show(f"比较相同版本 {cur_v} -> {cur_v}（差异应全空）", *call(
+        "GET", f"{base_url}/drills/{drill}/snapshots/{cur_v}/diff/{cur_v}"
+    ))
+
+    # 未留存版本明确报错（重传/失败回滚/封存均不产生快照）
+    show("取回未留存版本（应 404 snapshot_not_found）", *call(
+        "GET", f"{base_url}/drills/{drill}/snapshots/{cur_v + 100}"
+    ))
+
     show("封存演练", *call("POST", f"{base_url}/drills/{drill}/seal"))
+
+    # 封存不产生新快照；封存状态从现态读取（旧快照 sealed 也为 true）
+    show("封存后回看 0 版快照（sealed 应为 true，内容仍为空场）", *call(
+        "GET", f"{base_url}/drills/{drill}/snapshots/0"
+    ))
 
     status, body = call(
         "PUT", f"{base_url}/drills/{drill}/logs/R7",

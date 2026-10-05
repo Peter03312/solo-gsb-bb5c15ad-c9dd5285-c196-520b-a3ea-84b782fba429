@@ -18,6 +18,9 @@ from .schemas import (
     LockRequest,
     LogEntry,
     ResultResponse,
+    SnapshotDiffResponse,
+    SnapshotListResponse,
+    SnapshotResponse,
 )
 
 
@@ -30,7 +33,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="应急无线电演练通联日志互证服务",
-    version="1.1.0",
+    version="1.2.0",
     description=(
         "记录各台站通联日志，按相互指认、波段/模式一致、时差不超限的"
         "规则完成全场最优配对（最大配对数 → 最小总时差 → 字典序最小），"
@@ -183,6 +186,39 @@ def unlock_pair(drill_id: str, payload: LockRequest) -> dict:
 )
 def list_locks(drill_id: str) -> dict:
     return database.list_locks(drill_id)
+
+
+# --------------------------------------------------------------------------
+# 版本快照（复核员按版本回看/比较）：只读，不改变当前状态
+# --------------------------------------------------------------------------
+@app.get(
+    "/drills/{drill_id}/snapshots",
+    response_model=SnapshotListResponse,
+    tags=["snapshots"],
+    summary="列出已留存快照的版本号（升级前旧版本不可回看）",
+)
+def list_snapshots(drill_id: str) -> dict:
+    return database.list_snapshots(drill_id)
+
+
+@app.get(
+    "/drills/{drill_id}/snapshots/{version}",
+    response_model=SnapshotResponse,
+    tags=["snapshots"],
+    summary="取回指定版本快照（配对/未配对/总时差/锁定清单）",
+)
+def get_snapshot(drill_id: str, version: int) -> dict:
+    return database.get_snapshot(drill_id, version)
+
+
+@app.get(
+    "/drills/{drill_id}/snapshots/{from_version}/diff/{to_version}",
+    response_model=SnapshotDiffResponse,
+    tags=["snapshots"],
+    summary="比较两个已留存版本（相同版本差异为空；只读）",
+)
+def compare_snapshots(drill_id: str, from_version: int, to_version: int) -> dict:
+    return database.compare_snapshots(drill_id, from_version, to_version)
 
 
 @app.get("/health", tags=["system"], summary="健康检查")

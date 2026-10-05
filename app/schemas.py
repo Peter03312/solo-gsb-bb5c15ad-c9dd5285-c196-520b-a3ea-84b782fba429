@@ -188,6 +188,74 @@ class LockListResponse(StrictModel):
     result: ResultResponse
 
 
+# --------------------------------------------------------------------------
+# 版本快照（复核员按版本回看 / 比较）
+# --------------------------------------------------------------------------
+class SnapshotResponse(StrictModel):
+    """指定版本的留存快照：该版配对、未配对、总时差与锁定清单。"""
+
+    drill_id: str
+    version: int
+    sealed: bool
+    pairs: list[PairOut]
+    unpaired: list[str]
+    total_time_diff_seconds: float
+    locks: list[LockItem]
+    snapshot_at: str
+
+
+class SnapshotListResponse(StrictModel):
+    """已留存快照的版本号清单。"""
+
+    drill_id: str
+    versions: list[int]
+
+
+class PairDiff(StrictModel):
+    """同一记录对在两个版本间的时差变化。"""
+
+    record_a: str
+    record_b: str
+    from_time_diff_seconds: float
+    to_time_diff_seconds: float
+
+
+class PairDiffSection(StrictModel):
+    added: list[PairOut]
+    removed: list[PairOut]
+    time_diff_changed: list[PairDiff]
+
+
+class UnpairedDiffSection(StrictModel):
+    added: list[str]
+    removed: list[str]
+
+
+class LockDiffSection(StrictModel):
+    added: list[LockItem]
+    removed: list[LockItem]
+
+
+class TotalDiffSection(StrictModel):
+    from_: float = Field(..., alias="from")
+    to: float
+    delta: float
+
+    model_config = ConfigDict(extra="ignore", populate_by_name=True)
+
+
+class SnapshotDiffResponse(StrictModel):
+    """两个已留存版本的差异（相同版本各节均为空，delta 为 0）。"""
+
+    drill_id: str
+    from_version: int
+    to_version: int
+    pairs: PairDiffSection
+    unpaired: UnpairedDiffSection
+    locks: LockDiffSection
+    total_time_diff_seconds: TotalDiffSection
+
+
 class DrillResponse(StrictModel):
     drill_id: str
     allowed_time_diff_seconds: float
