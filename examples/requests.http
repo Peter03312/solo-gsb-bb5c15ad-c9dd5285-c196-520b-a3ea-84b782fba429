@@ -1,0 +1,110 @@
+### 应急无线电演练通联日志互证服务 —— 请求示例
+### 可直接用 IntelliJ HTTP Client / VS Code REST Client 执行。
+@host = http://127.0.0.1:8080
+@drill = DRILL-2026
+
+### 健康检查
+GET {{host}}/health
+
+### 创建演练（允许时差 10 秒，非负；非法负值返回 422）
+POST {{host}}/drills
+Content-Type: application/json
+
+{
+  "drill_id": "{{drill}}",
+  "allowed_time_diff_seconds": 10
+}
+
+### 查询演练状态
+GET {{host}}/drills/{{drill}}
+
+### 单条写入/更正日志（路径上的记录号优先；时间必须带时区）
+PUT {{host}}/drills/{{drill}}/logs/R1
+Content-Type: application/json
+
+{
+  "record_no": "R1",
+  "station": "BH1AAA",
+  "counterpart": "BH2BBB",
+  "time": "2026-10-04T08:00:00+08:00",
+  "band": "40m",
+  "mode": "SSB"
+}
+
+PUT {{host}}/drills/{{drill}}/logs/R2
+Content-Type: application/json
+
+{
+  "record_no": "R2",
+  "station": "BH2BBB",
+  "counterpart": "BH1AAA",
+  "time": "2026-10-04T00:00:05+00:00",
+  "band": "40m",
+  "mode": "SSB"
+}
+
+### 批量写入（整体事务；任一条非法或批次内记录号重复则整批拒绝）
+POST {{host}}/drills/{{drill}}/logs
+Content-Type: application/json
+
+{
+  "logs": [
+    {
+      "record_no": "R3",
+      "station": "BH3CCC",
+      "counterpart": "BH4DDD",
+      "time": "2026-10-04T00:00:00+00:00",
+      "band": "40m",
+      "mode": "SSB"
+    },
+    {
+      "record_no": "R4",
+      "station": "BH4DDD",
+      "counterpart": "BH3CCC",
+      "time": "2026-10-04T00:00:08+00:00",
+      "band": "40m",
+      "mode": "SSB"
+    }
+  ]
+}
+
+### 查看全部日志
+GET {{host}}/drills/{{drill}}/logs
+
+### 查询互证结果（配对 + 未配对 + 版本 + 总时差）
+GET {{host}}/drills/{{drill}}/result
+
+### 锁定一对互证候选（记录号顺序任意，服务端内部升序）
+### 仅接受：现存、相互指认、波段/模式相同、时差不超允许值，
+### 且两条记录均未被其他锁定占用。锁定强制入选结果（即使拉低全场配对数）。
+PUT {{host}}/drills/{{drill}}/locks
+Content-Type: application/json
+
+{
+  "record_a": "R1",
+  "record_b": "R2"
+}
+
+### 重复锁定同一对（含颠倒顺序）视为重传：200，版本不推进
+PUT {{host}}/drills/{{drill}}/locks
+Content-Type: application/json
+
+{
+  "record_a": "R2",
+  "record_b": "R1"
+}
+
+### 查询锁定清单及最新互证结果
+GET {{host}}/drills/{{drill}}/locks
+
+### 解除已有锁定（不存在则 404 lock_not_found；顺序同样任意）
+POST {{host}}/drills/{{drill}}/locks/unlock
+Content-Type: application/json
+
+{
+  "record_a": "R1",
+  "record_b": "R2"
+}
+
+### 封存演练（封存后写入与锁定操作均返回 409，查询仍可用）
+POST {{host}}/drills/{{drill}}/seal
