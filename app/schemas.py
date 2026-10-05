@@ -195,3 +195,87 @@ class DrillResponse(StrictModel):
     sealed: bool
     created_at: str
     sealed_at: str | None = None
+
+
+# --------------------------------------------------------------------------
+# 版本快照回看 / 比较（复核员）
+# --------------------------------------------------------------------------
+class SnapshotLockItem(BaseModel):
+    """快照中的锁定对；时差按现存日志现算，记录缺失时为 null。"""
+
+    record_a: str
+    record_b: str
+    time_diff_seconds: float | None = None
+
+
+class SnapshotResponse(StrictModel):
+    """指定版本的已留存快照；封存状态始终从现态读取。"""
+
+    drill_id: str
+    version: int
+    sealed: bool
+    pairs: list[PairOut]
+    unpaired: list[str]
+    total_time_diff_seconds: float
+    locks: list[SnapshotLockItem]
+    snapshot_created_at: str
+
+
+class SnapshotVersionItem(BaseModel):
+    version: int
+    snapshot_created_at: str
+
+
+class SnapshotListResponse(StrictModel):
+    drill_id: str
+    versions: list[SnapshotVersionItem]
+
+
+class PairChangeOut(BaseModel):
+    record_a: str
+    record_b: str
+    time_diff_seconds: float
+
+
+class LockChangeOut(BaseModel):
+    record_a: str
+    record_b: str
+
+
+class TimeDiffChangeOut(BaseModel):
+    """同一记录对在两版间的时差变化（单列，不计入新增/移除）。"""
+
+    record_a: str
+    record_b: str
+    time_diff_seconds_from: float
+    time_diff_seconds_to: float
+
+
+class PairDiff(BaseModel):
+    added: list[PairChangeOut]
+    removed: list[PairChangeOut]
+
+
+class UnpairedDiff(BaseModel):
+    added: list[str]
+    removed: list[str]
+
+
+class LockDiff(BaseModel):
+    added: list[LockChangeOut]
+    removed: list[LockChangeOut]
+
+
+class SnapshotDiffResponse(StrictModel):
+    """两个已留存版本的差异；相同版本各差异列表均为空。"""
+
+    drill_id: str
+    version_from: int
+    version_to: int
+    sealed: bool
+    pairs: PairDiff
+    unpaired: UnpairedDiff
+    locks: LockDiff
+    time_diff_changes: list[TimeDiffChangeOut]
+    total_time_diff_seconds_from: float
+    total_time_diff_seconds_to: float

@@ -70,6 +70,19 @@
 - **封存**演练后拒绝一切写入（返回 `409`），但仍可查询最终结果；
   封存本身不改变配对结果与版本。
 
+### 版本快照（复核员回看与比较）
+
+- **创建演练即留存版本 0 快照**（空场：无配对、无未配对、无锁定）；
+- 每次**日志写入或更正真正推进版本**、**锁定或解除锁定成功推进版本**时，
+  在**同一事务**内留存该版快照：配对清单、未配对记录、总时差与
+  **锁定清单**（记录号内部升序）；
+- **同内容重传、失败回滚（含 `lock_invalidated` 整批拒绝）、封存均不
+  产生新快照**；快照的封存状态不入库，回看时**始终从现态读取**；
+- **既有演练升级**后从升级时的**当前版本**开始留存（启动时自动补留
+  一张当前版本快照，幂等），**更早版本无法由现态复原、不补造**，
+  访问未留存版本返回 `404 snapshot_version_not_found`；
+- 回看与比较均为**只读**操作，不改变当前版本、结果与锁定状态。
+
 ---
 
 ## 2. 一键启动（Docker Compose，推荐）
@@ -99,8 +112,8 @@ docker compose down -v       # 停止并删除数据卷
 ### 仅用 Docker
 
 ```bash
-docker build -t qso-log-attestation:1.1.0 .
-docker run -d --name qso -p 8080:8080 -v qso-data:/data qso-log-attestation:1.1.0
+docker build -t qso-log-attestation:1.2.0 .
+docker run -d --name qso -p 8080:8080 -v qso-data:/data qso-log-attestation:1.2.0
 ```
 
 ---
@@ -325,6 +338,105 @@ curl -X POST http://127.0.0.1:8080/drills/DRILL-2026/locks/unlock \
 
 锁定操作的校验规则与错误见下节错误表。
 
+### 5.5 版本快照：回看与两版比较（复核员）
+
+所有快照接口均为**只读**：不推进版本、不改变配对结果与锁定清单。
+配对/未配对/锁定列表均按**记录号稳定升序**输出。
+
+#### `GET /drills/{drill_id}/snapshots` —— 列出已留存版本
+
+创建演练即有版本 `0`；返回按版本升序的快照清单。
+
+```bash
+curl http://127.0.0.1:8080/drills/DRILL-2026/snapshots
+```
+
+```json
+{
+  "drill_id": "DRILL-2026",
+  "versions": [
+    {"version": 0, "snapshot_created_at": "2026-10-04T12:00:00+00:00"},
+    {"version": 1, "snapshot_created_at": "2026-10-04T12:00:05+00:00"}
+  ]
+}
+```
+
+#### `GET /drills/{drill_id}/snapshots/{version}` —— 取回指定版本快照
+
+```bash
+curl http://127.0.0.1:8080/drills/DRILL-2026/snapshots/1
+```
+
+```json
+{
+  "drill_id": "DRILL-2026",
+  "version": 1,
+  "sealed": false,
+  "pairs": [
+    {"record_a": "R1", "record_b": "R2", "time_diff_seconds": 5.0}
+  ],
+  "unpaired": ["R7"],
+  "total_time_diff_seconds": 5.0,
+  "locks": [
+    {"record_a": "R1", "record_b": "R2", "time_diff_seconds": 5.0}
+  ],
+  "snapshot_created_at": "2026-10-04T12:00:05.000000+00:00"
+}
+```
+
+- `pairs` / `unpaired` / `total_time_diff_seconds` 为该版留存时的内容；
+- `locks` 为该版锁定清单；其中 `time_diff_seconds` 按**现存日志现算**
+  （与 `GET /locks` 一致），若锁定记录已不存在则为 `null`；
+- `sealed` 不入库，**始终从现态读取**（封存后回看旧版也显示
+  `"sealed": true`）。
+
+#### `GET /drills/{drill_id}/snapshots/compare?from_version=&to_version=` —— 比较两版
+
+```bash
+curl "http://127.0.0.1:8080/drills/DRILL-2026/snapshots/compare?from_version=1&to_version=4"
+```
+
+```json
+{
+  "drill_id": "DRILL-2026",
+  "version_from": 1,
+  "version_to": 4,
+  "sealed": false,
+  "pairs": {
+    "added":   [{"record_a": "R3", "record_b": "R6", "time_diff_seconds": 8.0}],
+    "removed": [{"record_a": "R1", "record_b": "R2", "time_diff_seconds": 5.0}]
+  },
+  "unpaired": {
+    "added":   ["R7"],
+    "removed": ["R3"]
+  },
+  "locks": {
+    "added":   [{"record_a": "R1", "record_b": "R2"}],
+    "removed": []
+  },
+  "time_diff_changes": [
+    {"record_a": "R4", "record_b": "R5",
+     "time_diff_seconds_from": 2.0, "time_diff_seconds_to": 6.0}
+  ],
+  "total_time_diff_seconds_from": 13.0,
+  "total_time_diff_seconds_to": 14.0
+}
+```
+
+比较语义：
+
+- `pairs.added/removed`：按记录对（内部升序）比较，**记录对本身**的
+  新增/移除，携带对应版本的时差；
+- `time_diff_changes`：**同一记录对在两版都配对、仅时差变化**时单列，
+  不计入 `added/removed`；
+- `unpaired.added/removed`：未配对记录号的新增/移除（记录号升序）；
+- `locks.added/removed`：人工锁定对的新增/移除（记录号升序）；
+- `from_version == to_version` 时所有差异列表为空，总时差两侧相等；
+  `from > to` 也允许，方向仅决定增删方向（反向比较增删互换）；
+- 任一版本未留存（含升级前历史版本）返回
+  `404 snapshot_version_not_found`；未知演练返回 `404 drill_not_found`；
+  缺少查询参数或非整数为 FastAPI 标准 `422`。
+
 ---
 
 ## 6. 错误响应与状态码
@@ -348,6 +460,7 @@ curl -X POST http://127.0.0.1:8080/drills/DRILL-2026/locks/unlock \
 | 锁定涉及的记录已被其他锁定占用 | `409` | `record_already_locked` |
 | 解除不存在的锁定 | `404` | `lock_not_found` |
 | 写入/更正使任一既有锁定失效 | `409` | `lock_invalidated`（整次写入拒绝、状态不变） |
+| 回看/比较的版本未留存快照（含升级前历史版本） | `404` | `snapshot_version_not_found` |
 
 ---
 
@@ -357,8 +470,8 @@ curl -X POST http://127.0.0.1:8080/drills/DRILL-2026/locks/unlock \
 .
 ├── app/
 │   ├── main.py          # FastAPI 路由、异常处理、lifespan 初始化
-│   ├── schemas.py       # 请求/响应模型与输入校验（时区/负值/同呼号）
-│   ├── database.py      # SQLite 持久化、事务、版本/封存/锁定逻辑
+│   ├── schemas.py       # 请求/响应模型与输入校验（时区/负值/同呼号/快照）
+│   ├── database.py      # SQLite 持久化、事务、版本/封存/锁定/版本快照逻辑
 │   ├── matching.py      # 配对核心算法（二分图最小费用最大流，支持强制锁定）
 │   └── config.py        # 环境变量配置
 ├── scripts/

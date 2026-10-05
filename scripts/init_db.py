@@ -12,7 +12,7 @@ from app import config, database
 def main() -> None:
     print(f"[init] 初始化数据库: {config.database_url()}")
     database.init_db()
-    print("[init] 完成：drills / logs / results / locks 表已就绪")
+    print("[init] 完成：drills / logs / results / locks / snapshots 表已就绪")
 
 
 if __name__ == "__main__":

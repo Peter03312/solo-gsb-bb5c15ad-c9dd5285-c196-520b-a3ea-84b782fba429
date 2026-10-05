@@ -72,6 +72,23 @@ CREATE TABLE IF NOT EXISTS locks (
     PRIMARY KEY (drill_id, record_a, record_b),
     FOREIGN KEY (drill_id) REFERENCES drills(drill_id)
 );
+
+-- 版本快照（复核员回看/比较）：版本 0 在创建演练时留存，此后每次版本
+-- 真正推进（异内容写入/更正、锁定、解除锁定）在同一事务内留存该版的
+-- 配对、未配对记录、总时差与锁定清单。重传、失败回滚、封存不产生快照。
+-- 既有演练仅从升级时的当前版本开始留存，更早版本不补造，故历史版本
+-- 查不到时按 snapshot_version_not_found 明确报错。
+CREATE TABLE IF NOT EXISTS snapshots (
+    drill_id                  TEXT NOT NULL,
+    version                   INTEGER NOT NULL,
+    pairs_json                TEXT NOT NULL,
+    unpaired_json             TEXT NOT NULL,
+    total_time_diff_seconds   REAL NOT NULL,
+    locks_json                TEXT NOT NULL,
+    created_at                TEXT NOT NULL,
+    PRIMARY KEY (drill_id, version),
+    FOREIGN KEY (drill_id) REFERENCES drills(drill_id)
+);
 """
 
 
@@ -151,6 +168,13 @@ class LockInvalidatedError(ServiceError):
     error_code = "lock_invalidated"
 
 
+class SnapshotVersionNotFoundError(ServiceError):
+    """请求回看/比较的版本没有留存快照（含升级前的历史版本）。"""
+
+    status_code = 404
+    error_code = "snapshot_version_not_found"
+
+
 # --------------------------------------------------------------------------
 # 连接管理
 # --------------------------------------------------------------------------
@@ -179,8 +203,67 @@ def init_db() -> None:
         conn.execute("PRAGMA journal_mode = WAL")
         conn.execute("PRAGMA synchronous = NORMAL")
         conn.executescript(SCHEMA)
+        _seed_current_snapshots(conn)
     finally:
         conn.close()
+
+
+def _seed_current_snapshots(conn: sqlite3.Connection) -> None:
+    """升级补丁：为没有任何快照的既有演练留存“当前版本”快照。
+
+    只在演练完全没有快照时执行一次（幂等）；升级前的历史版本无法由
+    现态复原，明确不补造。以现态 results/locks 填充，与升级后版本
+    推进时留存的快照同构。
+    """
+    rows = conn.execute(
+        """
+        SELECT d.drill_id AS drill_id, d.version AS version,
+               r.pairs_json AS pairs_json, r.unpaired_json AS unpaired_json,
+               r.total_time_diff_seconds AS total_time_diff_seconds,
+               r.recomputed_at AS recomputed_at
+        FROM drills d
+        LEFT JOIN results r ON r.drill_id = d.drill_id
+        WHERE NOT EXISTS (
+            SELECT 1 FROM snapshots s WHERE s.drill_id = d.drill_id
+        )
+        """
+    ).fetchall()
+    if not rows:
+        return
+    now = _now_iso()
+    with _write_tx(conn):
+        for row in rows:
+            lock_rows = conn.execute(
+                "SELECT record_a, record_b FROM locks WHERE drill_id = ? "
+                "ORDER BY record_a, record_b",
+                (row["drill_id"],),
+            ).fetchall()
+            locks_payload = [
+                [r["record_a"], r["record_b"]] for r in lock_rows
+            ]
+            conn.execute(
+                """
+                INSERT INTO snapshots (drill_id, version, pairs_json,
+                    unpaired_json, total_time_diff_seconds, locks_json,
+                    created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    row["drill_id"],
+                    row["version"],
+                    row["pairs_json"]
+                    if row["pairs_json"] is not None
+                    else "[]",
+                    row["unpaired_json"]
+                    if row["unpaired_json"] is not None
+                    else "[]",
+                    row["total_time_diff_seconds"]
+                    if row["total_time_diff_seconds"] is not None
+                    else 0.0,
+                    json.dumps(locks_payload, ensure_ascii=False),
+                    now,
+                ),
+            )
 
 
 @contextmanager
@@ -254,10 +337,8 @@ def _check_lock_candidate(
     raise LockNotCandidateError(message)
 
 
-def _persist_result(
-    conn: sqlite3.Connection, drill_id: str, version: int, result: MatchResult
-) -> None:
-    pairs_payload = [
+def _pairs_payload(result: MatchResult) -> list[dict]:
+    return [
         {
             "record_a": p.record_a,
             "record_b": p.record_b,
@@ -265,6 +346,13 @@ def _persist_result(
         }
         for p in result.pairs
     ]
+
+
+def _persist_result(
+    conn: sqlite3.Connection, drill_id: str, version: int, result: MatchResult
+) -> None:
+    pairs_payload = _pairs_payload(result)
+    at = _now_iso()
     conn.execute(
         """
         INSERT INTO results (drill_id, version, pairs_json, unpaired_json,
@@ -283,13 +371,43 @@ def _persist_result(
             json.dumps(pairs_payload, ensure_ascii=False),
             json.dumps(list(result.unpaired), ensure_ascii=False),
             result.total_time_diff_seconds,
-            _now_iso(),
+            at,
+        ),
+    )
+
+
+def _persist_snapshot(
+    conn: sqlite3.Connection,
+    drill_id: str,
+    version: int,
+    result: MatchResult,
+    lock_keys: list[tuple[str, str]],
+    created_at: str | None = None,
+) -> None:
+    """留存指定版本快照：配对/未配对/总时差取该版结果，锁定清单取该版
+    锁定键（记录号内部升序）。与结果、版本、锁定状态在同一事务提交。"""
+    pairs_payload = _pairs_payload(result)
+    conn.execute(
+        """
+        INSERT INTO snapshots (drill_id, version, pairs_json, unpaired_json,
+                               total_time_diff_seconds, locks_json, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            drill_id,
+            version,
+            json.dumps(pairs_payload, ensure_ascii=False),
+            json.dumps(list(result.unpaired), ensure_ascii=False),
+            result.total_time_diff_seconds,
+            json.dumps([list(k) for k in lock_keys], ensure_ascii=False),
+            created_at or _now_iso(),
         ),
     )
 
 
 def _recompute(conn: sqlite3.Connection, drill_id: str) -> None:
-    """重算全场配对：版本 +1（调用方负责），结果与版本同事务落库。
+    """重算全场配对：版本 +1（调用方负责），结果与版本同事务落库，
+    并在同一事务留存该版快照。
 
     先保留全部锁定对，再对剩余日志按“配对数最多、总时差最小、
     记录号字典序最小”求解；锁定即使降低全场配对数也不替换。
@@ -309,6 +427,7 @@ def _recompute(conn: sqlite3.Connection, drill_id: str) -> None:
         (version, drill_id),
     )
     _persist_result(conn, drill_id, version, result)
+    _persist_snapshot(conn, drill_id, version, result, lock_keys)
 
 
 def _get_drill_row(
@@ -344,8 +463,10 @@ def create_drill(drill_id: str, allowed_diff_secs: float) -> dict:
                 "sealed, created_at) VALUES (?, ?, 0, 0, ?)",
                 (drill_id, allowed_diff_secs, _now_iso()),
             )
-            # 空场结果：版本 0，无配对。
-            _persist_result(conn, drill_id, 0, MatchResult((), (), 0.0))
+            # 空场结果：版本 0，无配对；版本 0 可回看，同事务留存快照。
+            empty = MatchResult((), (), 0.0)
+            _persist_result(conn, drill_id, 0, empty)
+            _persist_snapshot(conn, drill_id, 0, empty, [])
         return get_drill(drill_id)
     finally:
         conn.close()
@@ -730,6 +851,189 @@ def get_result(drill_id: str) -> dict:
             "unpaired": json.loads(row["unpaired_json"]),
             "total_time_diff_seconds": row["total_time_diff_seconds"],
             "recomputed_at": row["recomputed_at"],
+        }
+    finally:
+        conn.close()
+
+
+# --------------------------------------------------------------------------
+# 版本快照回看 / 比较（只读，不改变当前状态）
+# --------------------------------------------------------------------------
+def _snapshot_row(
+    conn: sqlite3.Connection, drill_id: str, version: int
+) -> sqlite3.Row:
+    """取已留存快照行；演练未知 -> drill_not_found；版本未留存 ->
+    snapshot_version_not_found（升级前历史版本同样报此错）。"""
+    _get_drill_row(conn, drill_id)
+    row = conn.execute(
+        "SELECT * FROM snapshots WHERE drill_id = ? AND version = ?",
+        (drill_id, version),
+    ).fetchone()
+    if row is None:
+        raise SnapshotVersionNotFoundError(
+            f"演练 {drill_id} 的版本 {version} 未留存快照，无法回看"
+        )
+    return row
+
+
+def _snapshot_lock_items(
+    conn: sqlite3.Connection,
+    drill_id: str,
+    lock_keys: list[list[str]],
+    record_map: dict[str, Record] | None = None,
+) -> list[dict]:
+    """把快照中的锁定键展开为清单；时差按当前现存日志计算（与锁定
+    查询接口一致），记录已不存在时为 null。锁定键已按记录号升序存储。"""
+    if record_map is None:
+        record_map = _record_map(_load_records(conn, drill_id))
+    items = []
+    for key in lock_keys:
+        a, b = key[0], key[1]
+        diff = None
+        if a in record_map and b in record_map:
+            diff = (
+                abs(record_map[a].ts_micros - record_map[b].ts_micros)
+                / MICROS_PER_SECOND
+            )
+        items.append(
+            {"record_a": a, "record_b": b, "time_diff_seconds": diff}
+        )
+    return items
+
+
+def _snapshot_view(
+    conn: sqlite3.Connection, drill_id: str, row: sqlite3.Row
+) -> dict:
+    """组装单个快照的回看响应；封存状态始终从现态读取。"""
+    drill = _get_drill_row(conn, drill_id)
+    lock_keys = json.loads(row["locks_json"])
+    return {
+        "drill_id": drill_id,
+        "version": row["version"],
+        "sealed": bool(drill["sealed"]),
+        "pairs": json.loads(row["pairs_json"]),
+        "unpaired": json.loads(row["unpaired_json"]),
+        "total_time_diff_seconds": row["total_time_diff_seconds"],
+        "locks": _snapshot_lock_items(conn, drill_id, lock_keys),
+        "snapshot_created_at": row["created_at"],
+    }
+
+
+def get_snapshot(drill_id: str, version: int) -> dict:
+    """取回指定演练、指定版本的已留存快照（只读）。"""
+    conn = connect()
+    try:
+        row = _snapshot_row(conn, drill_id, version)
+        return _snapshot_view(conn, drill_id, row)
+    finally:
+        conn.close()
+
+
+def list_snapshots(drill_id: str) -> dict:
+    """列出演练全部已留存版本（含 0 版），按版本升序（只读）。"""
+    conn = connect()
+    try:
+        _get_drill_row(conn, drill_id)  # 未知演练 -> 404
+        rows = conn.execute(
+            "SELECT version, created_at FROM snapshots "
+            "WHERE drill_id = ? ORDER BY version",
+            (drill_id,),
+        ).fetchall()
+        return {
+            "drill_id": drill_id,
+            "versions": [
+                {"version": r["version"], "snapshot_created_at": r["created_at"]}
+                for r in rows
+            ],
+        }
+    finally:
+        conn.close()
+
+
+def compare_snapshots(drill_id: str, version_from: int, version_to: int) -> dict:
+    """比较两个已留存版本：按记录号稳定排序列出配对、未配对记录和锁定
+    对的新增与移除；同一记录对的时差变化单列。相同版本差异为空。
+
+    只读，不改变当前状态；封存状态仍从现态读取。
+    """
+    conn = connect()
+    try:
+        row_from = _snapshot_row(conn, drill_id, version_from)
+        row_to = _snapshot_row(conn, drill_id, version_to)
+        drill = _get_drill_row(conn, drill_id)
+
+        pairs_from = {
+            (p["record_a"], p["record_b"]): p["time_diff_seconds"]
+            for p in json.loads(row_from["pairs_json"])
+        }
+        pairs_to = {
+            (p["record_a"], p["record_b"]): p["time_diff_seconds"]
+            for p in json.loads(row_to["pairs_json"])
+        }
+        unpaired_from = set(json.loads(row_from["unpaired_json"]))
+        unpaired_to = set(json.loads(row_to["unpaired_json"]))
+        locks_from = {
+            (k[0], k[1]) for k in json.loads(row_from["locks_json"])
+        }
+        locks_to = {
+            (k[0], k[1]) for k in json.loads(row_to["locks_json"])
+        }
+
+        pair_added_keys = sorted(pairs_to.keys() - pairs_from.keys())
+        pair_removed_keys = sorted(pairs_from.keys() - pairs_to.keys())
+        diffs = []
+        for key in sorted(pairs_from.keys() & pairs_to.keys()):
+            before = pairs_from[key]
+            after = pairs_to[key]
+            if before != after:
+                diffs.append(
+                    {
+                        "record_a": key[0],
+                        "record_b": key[1],
+                        "time_diff_seconds_from": before,
+                        "time_diff_seconds_to": after,
+                    }
+                )
+        lock_added = sorted(locks_to - locks_from)
+        lock_removed = sorted(locks_from - locks_to)
+
+        def pair_payload(keys: list[tuple[str, str]], table: dict) -> list[dict]:
+            return [
+                {
+                    "record_a": a,
+                    "record_b": b,
+                    "time_diff_seconds": table[(a, b)],
+                }
+                for a, b in keys
+            ]
+
+        def lock_payload(keys: list[tuple[str, str]]) -> list[dict]:
+            return [{"record_a": a, "record_b": b} for a, b in keys]
+
+        return {
+            "drill_id": drill_id,
+            "version_from": version_from,
+            "version_to": version_to,
+            "sealed": bool(drill["sealed"]),
+            "pairs": {
+                "added": pair_payload(pair_added_keys, pairs_to),
+                "removed": pair_payload(pair_removed_keys, pairs_from),
+            },
+            "unpaired": {
+                "added": sorted(unpaired_to - unpaired_from),
+                "removed": sorted(unpaired_from - unpaired_to),
+            },
+            "locks": {
+                "added": lock_payload(lock_added),
+                "removed": lock_payload(lock_removed),
+            },
+            "time_diff_changes": diffs,
+            "total_time_diff_seconds_from": row_from[
+                "total_time_diff_seconds"
+            ],
+            "total_time_diff_seconds_to": row_to[
+                "total_time_diff_seconds"
+            ],
         }
     finally:
         conn.close()

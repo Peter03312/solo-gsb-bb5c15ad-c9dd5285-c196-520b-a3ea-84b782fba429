@@ -2,30 +2,7 @@
 
 from __future__ import annotations
 
-import os
-import tempfile
 import threading
-
-import pytest
-from fastapi.testclient import TestClient
-
-
-@pytest.fixture()
-def client(monkeypatch):
-    tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
-    tmp.close()
-    monkeypatch.setenv("QSO_DB_PATH", tmp.name)
-    # config 在调用时读环境变量；确保 app 启动初始化用的是临时库。
-    from app import database
-    from app.main import app
-
-    with TestClient(app) as c:
-        yield c
-    for suffix in ("", "-wal", "-shm"):
-        try:
-            os.unlink(tmp.name + suffix)
-        except OSError:
-            pass
 
 
 def _log(no, station, counterpart, t, band="40m", mode="SSB"):

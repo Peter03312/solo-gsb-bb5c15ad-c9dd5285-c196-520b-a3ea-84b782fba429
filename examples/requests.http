@@ -106,5 +106,22 @@ Content-Type: application/json
   "record_b": "R2"
 }
 
-### 封存演练（封存后写入与锁定操作均返回 409，查询仍可用）
+### 版本快照（复核员回看/比较，均为只读，不改变当前状态）
+
+### 列出全部已留存版本（创建演练即有 0 版；重传/失败回滚/封存不留快照）
+GET {{host}}/drills/{{drill}}/snapshots
+
+### 取回版本 0 快照（创建演练时的空场）
+GET {{host}}/drills/{{drill}}/snapshots/0
+
+### 取回版本 1 快照（该版配对、未配对、总时差与锁定清单；封存状态从现态读取）
+GET {{host}}/drills/{{drill}}/snapshots/1
+
+### 比较两个已留存版本（相同版本差异为空；任一版本未留存 -> 404）
+GET {{host}}/drills/{{drill}}/snapshots/compare?from_version=0&to_version=1
+
+### 反向比较也允许（增删方向互换）
+GET {{host}}/drills/{{drill}}/snapshots/compare?from_version=1&to_version=0
+
+### 封存演练（封存后写入与锁定操作均返回 409，查询仍可用；封存不产生新快照）
 POST {{host}}/drills/{{drill}}/seal

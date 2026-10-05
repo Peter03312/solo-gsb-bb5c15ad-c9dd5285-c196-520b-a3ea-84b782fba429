@@ -123,9 +123,50 @@ def main(base_url: str) -> None:
         {"record_a": "R2", "record_b": "R1"},
     ))
 
+    # --- 版本快照：回看与比较（只读，不改变当前状态）---
+    # 此前版本：0 创建；1 批量写入；2 补 R6（未配对）；3 更正 R6（配对）；
+    # 4 锁定 (R1,R2)；5 解除锁定。
+    show("列出已留存版本（应含 0..5，共 6 版）", *call(
+        "GET", f"{base_url}/drills/{drill}/snapshots"
+    ))
+
+    show("回看版本 0 快照（创建时的空场）", *call(
+        "GET", f"{base_url}/drills/{drill}/snapshots/0"
+    ))
+
+    show("回看版本 4 快照（锁定 (R1,R2) 在 locks 中）", *call(
+        "GET", f"{base_url}/drills/{drill}/snapshots/4"
+    ))
+
+    show("比较版本 3 -> 4（锁定新增；配对按锁定重排）", *call(
+        "GET",
+        f"{base_url}/drills/{drill}/snapshots/compare"
+        f"?from_version=3&to_version=4",
+    ))
+
+    show("比较版本 4 -> 5（锁定移除）", *call(
+        "GET",
+        f"{base_url}/drills/{drill}/snapshots/compare"
+        f"?from_version=4&to_version=5",
+    ))
+
+    show("比较相同版本 2 -> 2（差异应全为空）", *call(
+        "GET",
+        f"{base_url}/drills/{drill}/snapshots/compare"
+        f"?from_version=2&to_version=2",
+    ))
+
+    show("回看未留存版本 99（应 404 snapshot_version_not_found）", *call(
+        "GET", f"{base_url}/drills/{drill}/snapshots/99"
+    ))
+
     show("查询最终互证结果", *call("GET", f"{base_url}/drills/{drill}/result"))
 
     show("封存演练", *call("POST", f"{base_url}/drills/{drill}/seal"))
+
+    show("封存后回看旧快照（仍可回看，sealed 从现态读取为 true）", *call(
+        "GET", f"{base_url}/drills/{drill}/snapshots/0"
+    ))
 
     status, body = call(
         "PUT", f"{base_url}/drills/{drill}/logs/R7",
